@@ -1,0 +1,250 @@
+
+options(string.as.factor = F)
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+
+library(future)
+plan("multicore", workers = 4, future.seed=TRUE)
+options(future.globals.maxSize= 16*1024*1024*1024, future.seed = TRUE)
+
+
+library(ggsci)
+
+mycolor.1 <- RColorBrewer::brewer.pal(8, 'Set2')
+mycolor.2 <- RColorBrewer::brewer.pal(8, 'Accent')
+mycolor.3 <- RColorBrewer::brewer.pal(8, 'Dark2')
+mycolor.4 <- RColorBrewer::brewer.pal(12, 'Set3')
+colorseq = c(pal_npg("nrc")(10),
+             pal_jco("default", alpha = 0.6)(10),
+             pal_futurama("planetexpress", alpha = 0.6)(10),
+             mycolor.1, mycolor.2, mycolor.3,mycolor.4, 
+             mycolor.1, mycolor.2, mycolor.3,mycolor.4,
+             mycolor.1, mycolor.2, mycolor.3,mycolor.4,
+             mycolor.1, mycolor.2, mycolor.3,mycolor.4)
+
+
+
+setwd("/share/home/sunLab/gaojw/Adipose-snRNAseq/R_analysis_for_all_snRNA-seq")
+# setwd("c://Users/jwgao/Desktop/AdiposeTissue/R_for_snRNA-seq/")
+df.meta <- readxl::read_excel('./df.meta.xlsx')
+# df.meta <- df.meta %>%
+	# filter(Sample_id %in% c("6-10","6-24"))
+
+ids <- df.meta$Sample_id; ids
+# ids <- "T93-19"
+names(ids) <- ids
+
+## not run
+if(F){
+
+for(i in 1:length(ids)){
+  
+  id <- ids[i]
+  to <- paste0("/share/home/sunLab/gaojw/Adipose-snRNAseq/R_analysis_for_all_snRNA-seq/all_filtered_matrix/",
+               id,"/filtered_cell_gene_matrix/")
+  if(!file.exists(to)){
+    dir.create(to, recursive = T)
+  }
+  path_to_matrix <- df.meta$path_to_matrix[df.meta$Sample_id == id]
+  file.copy(from = paste0(path_to_matrix,"/filtered_cell_gene_matrix/","barcodes.tsv.gz"), 
+            to = paste0(to,"barcodes.tsv.gz"))
+  
+  file.copy(from = paste0(path_to_matrix,"/filtered_cell_gene_matrix/","features.tsv.gz"), 
+            to = paste0(to,"features.tsv.gz"))
+  
+  file.copy(from = paste0(path_to_matrix,"/filtered_cell_gene_matrix/","matrix.mtx.gz"), 
+            to = paste0(to,"matrix.mtx.gz"))
+    
+  
+}
+
+
+
+}
+
+Find_doublet <- function(data, dim.usage = 50, ratio=0.1){  # 需制定doublets的期望比例，C4的默认值为 0.05
+  library(DoubletFinder)
+  
+  # sweep.res.list <- paramSweep_v3(data, PCs = 1:dim.usage, sct = FALSE)
+  sweep.res.list <- paramSweep(data, PCs = 1:dim.usage, sct = FALSE)
+  sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  
+  ### Homotypic Doublet Proportion Estimate
+  homotypic.prop <- modelHomotypic(data@meta.data$seurat_clusters)
+  nExp_poi <- round(ratio*nrow(data@meta.data))  ## Assuming 7.5% doublet formation rate - tailor for your dataset
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  p <- as.numeric(as.vector(bcmvn[bcmvn$MeanBC==max(bcmvn$MeanBC),]$pK))
+  # data <- doubletFinder_v3(data, PCs = 1:dim.usage, pN = 0.25, pK = p, 
+	#						nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+							
+	data <- doubletFinder(data, PCs = 1:dim.usage, pN = 0.25, pK = p, 
+							nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+  colnames(data@meta.data)[ncol(data@meta.data)] = "doublet_info"
+  data<-subset(data,subset=doublet_info=="Singlet")
+  data
+}
+
+
+for(i in 1:length(ids)){
+  
+  id <- ids[i]
+  
+  path_to_matrix <- paste0("all_filtered_matrix/",id,"/filtered_cell_gene_matrix")
+  
+  cnt <- Seurat::Read10X(path_to_matrix)
+  sc <- Seurat::CreateSeuratObject(counts = cnt, project = id)
+  sc$log2nCount <- log2(sc$nCount_RNA+1)
+  sc$MT_pct <- PercentageFeatureSet(sc, pattern = "^MT-")
+  sc$Ribo_pct <- PercentageFeatureSet(sc, pattern = "^RP[SL]")
+  meta.data <- sc@meta.data %>%
+    rownames_to_column('cell_id') %>%
+    left_join(df.meta %>% rename(orig.ident = Sample_id)) %>%
+    as.data.frame %>%
+    column_to_rownames('cell_id')
+  sc@meta.data <- meta.data
+  
+  
+  path_to_QC <-  paste0("all_filtered_matrix/",id,"/QC/")
+  if(!file.exists(path_to_QC)){dir.create(path_to_QC)}
+  
+  if(T){
+    
+    ggdf <- sc@meta.data %>% rownames_to_column('cell_id')
+    p0 <- ggplot(ggdf)+
+      theme_void()+
+      geom_text(aes(x = 1,y=1),
+                label = paste0("no.cell = ", nrow(ggdf)," / ", unique(ggdf$Loading_No)),
+                size = 2)
+    
+    p1 <- ggplot(ggdf)+
+      theme_classic(base_size = 10, base_line_size = 0.25)+
+      # geom_histogram(aes(x = nFeature_RNA), bins = 1e4)+
+      # geom_density(aes(x = nFeature_RNA))+
+      geom_violin(aes(x = orig.ident, y = nFeature_RNA), fill='grey')+
+      geom_hline(yintercept = quantile(ggdf$nFeature_RNA, probs = c(0.99, 0.995,0.9975,0.999)), linewidth = 0.2)
+    
+    p2 <- ggplot(ggdf)+
+      theme_classic(base_size = 10, base_line_size = 0.25)+
+      # geom_histogram(aes(x = nFeature_RNA), bins = 1e4)+
+      # geom_density(aes(x = nFeature_RNA))+
+      geom_violin(aes(x = orig.ident, y = nCount_RNA), fill='grey')+
+      geom_hline(yintercept = quantile(ggdf$nCount_RNA, probs = c(0.99, 0.995,0.9975,0.999)), linewidth = 0.2)+
+      coord_flip()+
+      theme(axis.title = element_blank(), axis.line = element_blank(), axis.text = element_blank(), axis.ticks = element_blank())
+    
+    p3 <- ggplot(ggdf)+
+      theme_classic(base_size = 10, base_line_size = 0.25)+
+      # geom_histogram(aes(x = nFeature_RNA), bins = 1e4)+
+      # geom_density(aes(x = nFeature_RNA))+
+      geom_violin(aes(x = orig.ident, y = MT_pct), fill='grey')+
+      geom_hline(yintercept = quantile(ggdf$MT_pct, probs = c(0.99, 0.995,0.9975,0.999)), linewidth = 0.2)
+    
+    
+    p4 <- ggplot(ggdf)+
+      theme_classic(base_size = 10, base_line_size = 0.25)+
+      geom_point(aes(x = nCount_RNA, y = nFeature_RNA), alpha = 0.5, color='grey10', size = 0.8)+
+      geom_vline(xintercept = quantile(ggdf$nCount_RNA, probs = c(0.99, 0.995,0.9975,0.999)), color=alpha('grey',0.6), linewidth = 0.2)+
+      geom_hline(yintercept = quantile(ggdf$nFeature_RNA, probs = c(0.99, 0.995,0.9975,0.999)), color=alpha('grey',0.6), linewidth = 0.2)+
+      theme(axis.title.y = element_blank(),
+            axis.line.y = element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank())
+    
+    
+    
+    p <- p0+p2+p1+p4+p3+plot_layout(design = c("
+122225
+344445
+344445
+344445
+344445"))
+    
+    
+    ggsave(filename = paste0(path_to_QC,"/01.UMI.genes.MT.before.filter.tiff"),
+           plot = p,
+           width = 18, height = 12, units = 'cm',
+           dpi = 300)
+  }
+  
+  sc <- sc %>% 
+    FindVariableFeatures() %>% 
+    NormalizeData(scale.factor = 10000) %>% 
+    ScaleData(vars.to.regress = c('nCount_RNA','MT_pct')) %>% 
+    RunPCA() %>% 
+    FindNeighbors(dims = 1:30) %>% 
+    FindClusters() %>% 
+    RunUMAP(dims = 1:30)
+  
+  # DB.ratio <- df.meta$Agg_Rate[df.meta$Sample_id== id] * 0.33
+  # DB.ratio <- round(DB.ratio,digits = 2)
+  # DB.ratio <- max(0.05, DB.ratio)
+  DB.ratio <- 0.1
+  sc <- Find_doublet(data = sc, dim.usage = 50, ratio = DB.ratio)
+
+
+  minFeature <- 200
+  maxFeature <- quantile(sc$nFeature_RNA, probs = 0.999)
+  # minCount <- quantile(sc$nCount_RNA, probs = 0.0001)
+  minCount <- 500
+  maxCount <- quantile(sc$nCount_RNA, probs = 0.999)
+  maxMT_pct = quantile(sc$MT_pct, probs = 0.999)
+  
+  sc$Outlier <- ifelse((sc$nFeature_RNA < min(minFeature, 200) | sc$nFeature_RNA > maxFeature |
+                          sc$nCount_RNA < min(minCount, 500)  | sc$nCount_RNA > maxCount |
+                          sc$MT_pct > min(maxMT_pct, 5)), "Yes", "No"  )
+  
+  sc <- subset(sc, subset = Outlier == 'No')
+  
+  qs::qsave(sc, file = paste0(paste0("all_filtered_matrix/",id,"/",id,".qs")))
+  
+  meta.data <- sc@meta.data %>% 
+    as.data.frame %>% 
+    rownames_to_column('Cell_id') %>%
+    mutate(Cell_id_original = Cell_id) %>% 
+    mutate(Cell_id = paste0(orig.ident,"-", Cell_id)) %>% 
+    as.data.frame()
+  rownames(meta.data) <- meta.data$Cell_id
+  
+  data.table::fwrite(meta.data, file = paste0(path_to_matrix,"/meta_data.csv"), sep = ",",
+                     quote = F, row.names = T, col.names = T)
+    
+  rm(id, sc, meta.data)
+    
+  
+  
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
